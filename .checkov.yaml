@@ -1,0 +1,8 @@
+# Checks that do not apply are skipped inline, next to the resource, with the reason.
+framework:
+  - terraform
+  - cloudformation
+  - github_actions
+  - secrets
+compact: true
+quiet: true
