@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  org-patch-manager member template. Deployed into every account and region by
+  the org-patch-manager StackSet (or as a plain stack in one account). Registers
+  AL2023 and Ubuntu baselines as the OS defaults, scans every managed instance
+  daily, installs nightly on instances opted in with the reboot tag, and can
+  export patch compliance to a central S3 bucket.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: sec
+    AllowedPattern: '[a-z0-9-]{1,20}'
+    Description: Prefix for baseline, association and sync names.
+  ApproveAfterDays:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 360
+    Description: Days an AL2023 security or bugfix update soaks before it is auto-approved.
+  ScanSchedule:
+    Type: String
+    Default: rate(1 day)
+  InstallSchedule:
+    Type: String
+    Default: cron(0 9 * * ? *)
+    Description: When the install associations run (UTC).
+  RebootOption:
+    Type: String
+    Default: RebootIfNeeded
+    AllowedValues: [RebootIfNeeded, NoReboot]
+    Description: Reboot behaviour for instances tagged <RebootTagKey>=if-needed. NoReboot pauses reboots everywhere.
+  RebootTagKey:
+    Type: String
+    Default: patch-reboot
+    Description: Tag that opts an instance into installs. Values if-needed or never.
+  InstallMaxConcurrency:
+    Type: String
+    Default: '1'
+    Description: Instances patched at the same time per account.
+  InstallMaxErrors:
+    Type: String
+    Default: '100%'
+    Description: Failures before an install run stops. 100% keeps one broken host from blocking the rest.
+  ComplianceBucketName:
+    Type: String
+    Default: ''
+    Description: Central S3 bucket for the patch-compliance Resource Data Sync. Empty means no sync.
+  ComplianceBucketRegion:
+    Type: String
+    Default: ''
+    Description: Region of the compliance bucket. Empty means this stack's region.
+
+Conditions:
+  HasComplianceBucket: !Not [!Equals [!Ref ComplianceBucketName, '']]
+  HasComplianceBucketRegion: !Not [!Equals [!Ref ComplianceBucketRegion, '']]
+
+Resources:
+
+  # ---------------- Patch baselines ----------------
+
+  LinuxPatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: !Sub '${NamePrefix}-al2023'
+      OperatingSystem: AMAZON_LINUX_2023
+      Description: !Sub 'AL2023 security and bugfix updates, auto-approved after ${ApproveAfterDays} days'
+      ApprovalRules:
+        PatchRules:
+          - ComplianceLevel: CRITICAL
+            ApproveAfterDays: !Ref ApproveAfterDays
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: CLASSIFICATION
+                  Values: [Security, Bugfix]
+
+  UbuntuPatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: !Sub '${NamePrefix}-ubuntu'
+      OperatingSystem: UBUNTU
+      Description: Ubuntu required, important and standard updates
+      ApprovalRules:
+        PatchRules:
+          # APT repositories have no reliable release dates, so there is no
+          # soak period: approved updates install on the next run.
+          - ComplianceLevel: CRITICAL
+            ApproveAfterDays: 0
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: PRODUCT
+                  Values: ['*']
+                - Key: PRIORITY
+                  Values: [Required, Important, Standard]
+                - Key: SECTION
+                  Values: ['*']
+
+  # ---------------- Register the baselines as the OS defaults ----------------
+  # CloudFormation has no resource for "default patch baseline", so a small
+  # custom resource calls ssm:RegisterDefaultPatchBaseline. Being the default is
+  # what applies a baseline to every instance of that OS, with no Patch Group
+  # tags to maintain.
+
+  DefaultBaselineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Holds only the function's own status lines; the default service encryption is enough.
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-default-baseline'
+      RetentionInDays: 90
+
+  DefaultBaselineRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: Reverting to an AWS-owned baseline on delete needs a baseline ARN outside this account.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: register-default-baseline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:RegisterDefaultPatchBaseline
+                  - ssm:GetDefaultPatchBaseline
+                  - ssm:DescribePatchBaselines
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DefaultBaselineLogGroup.Arn
+
+  DefaultBaselineFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Reserved concurrency fails in new accounts whose concurrency quota is still at the minimum.
+          - id: CKV_AWS_116
+            comment: Invoked synchronously by CloudFormation, which reports failures itself.
+          - id: CKV_AWS_117
+            comment: Calls only the SSM API; a VPC would add NAT or endpoint costs for no benefit.
+          - id: CKV_AWS_173
+            comment: The function has no environment variables.
+    Properties:
+      Description: Registers a patch baseline as the default for its operating system.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt DefaultBaselineRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref DefaultBaselineLogGroup
+      Code:
+        ZipFile: |
+          import json, urllib.request
+          import boto3
+
+          ssm = boto3.client('ssm')
+
+          def respond(event, context, status, physical_id, reason=''):
+              # Stdlib response, so the function does not depend on the
+              # cfn-response helper being available in the runtime.
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or 'See log stream ' + context.log_stream_name,
+                  'PhysicalResourceId': physical_id,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+              }).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': ''})
+              urllib.request.urlopen(req, timeout=30)
+
+          def aws_default_baseline(operating_system):
+              # The AWS-owned default baseline for the OS, restored on delete.
+              ids = ssm.describe_patch_baselines(Filters=[
+                  {'Key': 'OWNER', 'Values': ['AWS']},
+                  {'Key': 'OPERATING_SYSTEM', 'Values': [operating_system]},
+              ]).get('BaselineIdentities', [])
+              for b in ids:
+                  if 'Default' in b.get('BaselineName', ''):
+                      return b['BaselineId']
+              return ids[0]['BaselineId'] if ids else None
+
+          def handler(event, context):
+              props = event.get('ResourceProperties', {})
+              baseline_id = props.get('BaselineId', '')
+              physical_id = event.get('PhysicalResourceId') or baseline_id or 'none'
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      ssm.register_default_patch_baseline(BaselineId=baseline_id)
+                      physical_id = baseline_id
+                  else:
+                      # Revert only if our baseline is still the default. After an
+                      # update replaces the baseline, CloudFormation deletes the old
+                      # physical ID; the new baseline must stay registered.
+                      try:
+                          os_name = props.get('OperatingSystem')
+                          current = ssm.get_default_patch_baseline(OperatingSystem=os_name)['BaselineId']
+                          if current.endswith(physical_id):
+                              aws_id = aws_default_baseline(os_name)
+                              if aws_id:
+                                  ssm.register_default_patch_baseline(BaselineId=aws_id)
+                      except Exception as e:
+                          print('delete revert (non-fatal):', e)
+                  respond(event, context, 'SUCCESS', physical_id)
+              except Exception as e:
+                  print('ERROR:', e)
+                  respond(event, context, 'FAILED', physical_id, str(e)[:500])
+
+  LinuxDefaultBaseline:
+    Type: Custom::DefaultPatchBaseline
+    Properties:
+      ServiceToken: !GetAtt DefaultBaselineFunction.Arn
+      BaselineId: !Ref LinuxPatchBaseline
+      OperatingSystem: AMAZON_LINUX_2023
+
+  UbuntuDefaultBaseline:
+    Type: Custom::DefaultPatchBaseline
+    Properties:
+      ServiceToken: !GetAtt DefaultBaselineFunction.Arn
+      BaselineId: !Ref UbuntuPatchBaseline
+      OperatingSystem: UBUNTU
+
+  # ---------------- Daily compliance scan (read-only, never reboots) ----------------
+
+  DailyScanAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunPatchBaseline
+      AssociationName: !Sub '${NamePrefix}-patch-scan'
+      ScheduleExpression: !Ref ScanSchedule
+      MaxConcurrency: '100%'
+      MaxErrors: '100%'
+      Targets:
+        - Key: InstanceIds
+          Values: ['*']
+      Parameters:
+        Operation: [Scan]
+
+  # ---------------- Nightly install, opted in by tag ----------------
+  # Every managed instance is scanned, but only tagged instances are patched:
+  #
+  #   <RebootTagKey>=if-needed  installs, reboots if an update needs it (RebootOption)
+  #   <RebootTagKey>=never      installs, never reboots; the operator picks the time
+  #   (no tag)                  scanned only, so nothing reboots before someone decides how
+  #
+  # Association targets are include-only, so the reboot carve-out needs its own
+  # association. ApplyOnlyAtCronInterval stops State Manager from running an
+  # install on every matching instance the moment the association is created.
+
+  InstallRebootAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunPatchBaseline
+      AssociationName: !Sub '${NamePrefix}-patch-install-reboot'
+      ScheduleExpression: !Ref InstallSchedule
+      ApplyOnlyAtCronInterval: true
+      MaxConcurrency: !Ref InstallMaxConcurrency
+      MaxErrors: !Ref InstallMaxErrors
+      Targets:
+        - Key: !Sub 'tag:${RebootTagKey}'
+          Values: [if-needed]
+      Parameters:
+        Operation: [Install]
+        RebootOption: [!Ref RebootOption]
+
+  InstallNoRebootAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunPatchBaseline
+      AssociationName: !Sub '${NamePrefix}-patch-install-noreboot'
+      ScheduleExpression: !Ref InstallSchedule
+      ApplyOnlyAtCronInterval: true
+      MaxConcurrency: !Ref InstallMaxConcurrency
+      MaxErrors: !Ref InstallMaxErrors
+      Targets:
+        - Key: !Sub 'tag:${RebootTagKey}'
+          Values: [never]
+      Parameters:
+        Operation: [Install]
+        RebootOption: [NoReboot]
+
+  # ---------------- Central compliance export (optional) ----------------
+
+  PatchComplianceSync:
+    Type: AWS::SSM::ResourceDataSync
+    Condition: HasComplianceBucket
+    Properties:
+      SyncName: !Sub '${NamePrefix}-patch-compliance'
+      S3Destination:
+        BucketName: !Ref ComplianceBucketName
+        BucketRegion: !If [HasComplianceBucketRegion, !Ref ComplianceBucketRegion, !Ref 'AWS::Region']
+        SyncFormat: JsonSerDe
+
+Outputs:
+  LinuxBaselineId:
+    Value: !Ref LinuxPatchBaseline
+  UbuntuBaselineId:
+    Value: !Ref UbuntuPatchBaseline
