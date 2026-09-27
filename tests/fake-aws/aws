@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Fake `aws` CLI for the script tests and `make demo`.
+
+Answers the read-only calls from a scenario file, accepts every write, and
+appends each call to $FAKE_AWS_LOG as a JSON line. Nothing leaves the machine.
+"""
+
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GLOBAL_OPTS = {"--profile", "--region", "--query", "--output"}
+
+
+def parse(argv):
+    opts, rest, i = {}, [], 0
+    while i < len(argv):
+        if argv[i] in GLOBAL_OPTS:
+            opts[argv[i][2:]] = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    return opts, rest
+
+
+def answer(scenario, opts, rest):
+    call = (rest[0], rest[1])
+    region = scenario["regions"].get(opts.get("region", ""), {})
+    if call == ("configure", "get"):
+        return scenario.get("configured_region", "")
+    if call == ("ec2", "describe-regions"):
+        return "\t".join(scenario["regions"])
+    if call == ("ec2", "describe-instances"):
+        return "\t".join(region.get("unclassified_instances", []))
+    if call == ("organizations", "describe-organization"):
+        return scenario["org_id"]
+    if call == ("cloudformation", "describe-stacks"):
+        return scenario["compliance_bucket"]
+    if call == ("cloudformation", "describe-stack-set"):
+        if not scenario.get("stack_set_exists"):
+            sys.stderr.write("StackSetNotFoundException\n")
+            sys.exit(254)
+        return "{}"
+    if call in (("cloudformation", "update-stack-set"), ("cloudformation", "create-stack-instances")):
+        return "op-0001"
+    if call == ("cloudformation", "describe-stack-set-operation"):
+        return "SUCCEEDED"
+    return ""  # a write: accept it
+
+
+def main():
+    opts, rest = parse(sys.argv[1:])
+    path = os.environ.get("FAKE_AWS_SCENARIO", os.path.join(HERE, "scenario.json"))
+    with open(path) as f:
+        scenario = json.load(f)
+    log = os.environ.get("FAKE_AWS_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(json.dumps({"opts": opts, "args": rest}) + "\n")
+    out = answer(scenario, opts, rest)
+    if out:
+        print(out)
+
+
+if __name__ == "__main__":
+    main()
