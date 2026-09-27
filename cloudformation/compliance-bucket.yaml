@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  org-patch-manager central compliance bucket. Deploy once in the log-archive
+  account. Every account's SSM Resource Data Sync writes its patch compliance
+  here. SSE-S3 rather than KMS: many cross-account writers and low-sensitivity
+  operational data, so per-account key grants would add work without adding
+  protection.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: sec
+  BucketName:
+    Type: String
+    Default: ''
+    Description: Empty means <NamePrefix>-patch-compliance-<account ID>.
+  OrgId:
+    Type: String
+    AllowedPattern: 'o-[a-z0-9]{10,32}'
+    Description: AWS Organizations ID whose accounts may write.
+  RetentionDays:
+    Type: Number
+    Default: 395
+    MinValue: 1
+
+Conditions:
+  HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+
+Resources:
+  ComplianceBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Operational metadata written only by the SSM service; access logs would cost more than they reveal.
+    Properties:
+      BucketName: !If [HasBucketName, !Ref BucketName, !Sub '${NamePrefix}-patch-compliance-${AWS::AccountId}']
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-compliance-data
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ComplianceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ComplianceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SSMBucketAcl
+            Effect: Allow
+            Principal: { Service: ssm.amazonaws.com }
+            Action: [s3:GetBucketAcl, s3:ListBucket]
+            Resource: !GetAtt ComplianceBucket.Arn
+            Condition:
+              StringEquals: { 'aws:SourceOrgID': !Ref OrgId }
+          - Sid: SSMBucketDelivery
+            Effect: Allow
+            Principal: { Service: ssm.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub '${ComplianceBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceOrgID': !Ref OrgId
+                's3:x-amz-acl': bucket-owner-full-control
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt ComplianceBucket.Arn, !Sub '${ComplianceBucket.Arn}/*']
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+Outputs:
+  BucketName:
+    Value: !Ref ComplianceBucket
+  BucketRegion:
+    Value: !Ref 'AWS::Region'

@@ -58,6 +58,7 @@ resource "aws_cloudformation_stack_set_instance" "this" {
 }
 
 resource "aws_cloudformation_stack" "management" {
+  #checkov:skip=CKV_AWS_124:Deployed and watched by Terraform, which reports stack failures itself.
   for_each = var.deploy_to_management_account ? toset(var.regions) : toset([])
   region   = each.key
 
