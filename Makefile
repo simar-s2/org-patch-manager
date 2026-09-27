@@ -36,7 +36,9 @@ checkov: ## Static security scan of Terraform, CloudFormation and CI
 shellcheck: ## Lint the shell scripts
 	shellcheck scripts/*.sh
 
+demo: export PATH := $(CURDIR)/tests/fake-aws:$(PATH)
 demo: ## The recording in the README: terraform test, then a reboot-tag dry run against the fake AWS CLI
 	@terraform init -backend=false -input=false >/dev/null
 	terraform test
-	@PATH="$(CURDIR)/tests/fake-aws:$$PATH" scripts/default-reboot-tag.sh --regions us-east-1,us-west-2 --dry-run
+	@echo
+	scripts/default-reboot-tag.sh --regions us-east-1,us-west-2 --dry-run
